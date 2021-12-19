@@ -1,9 +1,11 @@
-import { Adapter } from "next-auth/adapters"
+import type { Adapter } from "next-auth/adapters"
 import { createHash, randomUUID } from "crypto"
 
 export interface TestOptions {
   adapter: Adapter
   db: {
+    /** Generates UUID v4 by default. Use it to override how the test suite should generate IDs, like user id. */
+    id?: () => string
     /**
      * Manually disconnect database after all tests have been run,
      * if your adapter doesn't do it automatically
@@ -37,22 +39,30 @@ export interface TestOptions {
  * You can add additional tests below, if you wish.
  */
 export function runBasicTests(options: TestOptions) {
+  const id = options.db.id ?? randomUUID
   // Init
   beforeAll(async () => {
     await options.db.connect?.()
   })
 
+  const { adapter, db } = options
+
   afterAll(async () => {
+    // @ts-expect-error This is only used for the TypeORM adapter
+    await adapter.__disconnect?.()
     await options.db.disconnect?.()
   })
-
-  const { adapter, db } = options
 
   let user: any = {
     email: "fill@murray.com",
     image: "https://www.fillmurray.com/460/300",
     name: "Fill Murray",
     emailVerified: new Date(),
+  }
+
+  if (process.env.CUSTOM_MODEL === "1") {
+    user.role = "admin"
+    user.phone = "00000000000"
   }
 
   const session: any = {
@@ -67,8 +77,6 @@ export function runBasicTests(options: TestOptions) {
     access_token: randomUUID(),
     expires_at: ONE_MONTH,
     id_token: randomUUID(),
-    oauth_token: randomUUID(),
-    oauth_token_secret: randomUUID(),
     refresh_token: randomUUID(),
     token_type: "bearer",
     scope: "user",
@@ -105,7 +113,7 @@ export function runBasicTests(options: TestOptions) {
   })
 
   test("getUser", async () => {
-    expect(await adapter.getUser("non-existent-user-id")).toBeNull()
+    expect(await adapter.getUser(id())).toBeNull()
     expect(await adapter.getUser(user.id)).toEqual(user)
   })
 
@@ -280,20 +288,24 @@ export function runBasicTests(options: TestOptions) {
     expect(dbUser).toEqual(user)
 
     // Re-populate db with session and account
+    delete session.id
     await adapter.createSession(session)
     await adapter.linkAccount(account)
 
     await adapter.deleteUser?.(user.id)
     dbUser = await db.user(user.id)
+    // User should not exist after it is deleted
     expect(dbUser).toBeNull()
 
     const dbSession = await db.session(session.sessionToken)
+    // Session should not exist after user is deleted
     expect(dbSession).toBeNull()
 
     const dbAccount = await db.account({
       provider: account.provider,
       providerAccountId: account.providerAccountId,
     })
+    // Account should not exist after user is deleted
     expect(dbAccount).toBeNull()
   })
 }
