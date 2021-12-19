@@ -1,283 +1,243 @@
-import type firebase from "firebase"
-import { createHash, randomBytes } from "crypto"
-import { Adapter } from "next-auth/adapters"
-import {
-  querySnapshotToObject,
-  docSnapshotToObject,
-  stripUndefined,
-} from "./utils"
-import { Profile, Session, User } from "next-auth"
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
+import type {
+  runTransaction,
+  collection,
+  query,
+  getDocs,
+  where,
+  limit,
+  doc,
+  getDoc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  Firestore,
+  FirestoreDataConverter,
+} from "firebase/firestore"
 
-interface FirebaseVerificationRequest {
-  id: string
-  identifier: string
-  token: string
-  expires: Date
+import type { Account } from "next-auth"
+
+import type {
+  Adapter,
+  AdapterSession,
+  AdapterUser,
+  VerificationToken,
+} from "next-auth/adapters"
+
+export const collections = {
+  Users: "users",
+  Sessions: "sessions",
+  Accounts: "accounts",
+  VerificationTokens: "verificationTokens",
+} as const
+
+export const format: FirestoreDataConverter<any> = {
+  toFirestore(object) {
+    const newObjectobject: any = {}
+    for (const key in object) {
+      const value = object[key]
+      if (value === undefined) continue
+      newObjectobject[key] = value
+    }
+    return newObjectobject
+  },
+  fromFirestore(snapshot) {
+    if (!snapshot.exists()) return null
+    const newUser: any = { ...snapshot.data(), id: snapshot.id }
+    for (const key in newUser) {
+      const value = newUser[key]
+      if (value?.toDate) newUser[key] = value.toDate()
+      else newUser[key] = value
+    }
+    return newUser
+  },
 }
 
-export type FirebaseSession = Session & {
-  id: string
-  expires: Date
+export interface FirebaseClient {
+  db: Firestore
+  collection: typeof collection
+  query: typeof query
+  getDocs: typeof getDocs
+  where: typeof where
+  limit: typeof limit
+  doc: typeof doc
+  getDoc: typeof getDoc
+  addDoc: typeof addDoc
+  updateDoc: typeof updateDoc
+  deleteDoc: typeof deleteDoc
+  runTransaction: typeof runTransaction
 }
 
-// @ts-expect-error
-export const FirebaseAdapter: Adapter<
-  firebase.firestore.Firestore,
-  never,
-  User & { id: string },
-  Profile,
-  FirebaseSession
-> = (client) => {
+export function FirebaseAdapter(client: FirebaseClient): Adapter {
+  const {
+    db,
+    collection,
+    query,
+    getDocs,
+    where,
+    limit,
+    doc,
+    getDoc,
+    addDoc,
+    updateDoc,
+    deleteDoc,
+    runTransaction,
+  } = client
+
+  const Users = collection(db, collections.Users).withConverter<AdapterUser>(
+    format
+  )
+
+  const Sessions = collection(
+    db,
+    collections.Sessions
+  ).withConverter<AdapterSession>(format)
+
+  const Accounts = collection(db, collections.Accounts).withConverter<Account>(
+    format
+  )
+  const VerificationTokens = collection(
+    db,
+    collections.VerificationTokens
+  ).withConverter<VerificationToken>(format)
+
   return {
-    async getAdapter({ session, secret, ...appOptions }) {
-      const sessionMaxAge = session.maxAge * 1000 // default is 30 days
-      const sessionUpdateAge = session.updateAge * 1000 // default is 1 day
-      /**
-       * @todo Move this to core package
-       * @todo Use bcrypt or a more secure method
-       */
-      const hashToken = (token: string) =>
-        createHash("sha256").update(`${token}${secret}`).digest("hex")
+    async createUser(user) {
+      const { id } = await addDoc(Users, user)
+      return { ...(user as any), id }
+    },
+    async getUser(id) {
+      const userDoc = await getDoc(doc(Users, id))
+      if (!userDoc.exists()) return null
+      return Users.converter!.fromFirestore(userDoc)
+    },
+    async getUserByEmail(email) {
+      const userQuery = query(Users, where("email", "==", email), limit(1))
+      const userDocs = await getDocs(userQuery)
+      if (userDocs.empty) return null
+      return Users.converter!.fromFirestore(userDocs.docs[0])
+    },
+    async getUserByAccount({ provider, providerAccountId }) {
+      const accountQuery = query(
+        Accounts,
+        where("provider", "==", provider),
+        where("providerAccountId", "==", providerAccountId),
+        limit(1)
+      )
+      const accountDocs = await getDocs(accountQuery)
+      if (accountDocs.empty) return null
+      const userDoc = await getDoc(
+        doc(Users, accountDocs.docs[0].data().userId)
+      )
+      if (!userDoc.exists()) return null
+      return Users.converter!.fromFirestore(userDoc)
+    },
 
-      return {
-        displayName: "FIREBASE",
-        async createUser(profile) {
-          const userRef = await client.collection("users").add(
-            stripUndefined({
-              name: profile.name,
-              email: profile.email,
-              image: profile.image,
-              emailVerified: profile.emailVerified ?? null,
-            })
-          )
-          const snapshot = await userRef.get()
-          const user = docSnapshotToObject(snapshot)
-          return user
-        },
+    async updateUser(partialUser) {
+      await updateDoc(doc(Users, partialUser.id), partialUser)
+      const userDoc = await getDoc(doc(Users, partialUser.id))
+      return Users.converter!.fromFirestore(userDoc as any)!
+    },
 
-        async getUser(id) {
-          const snapshot = await client.collection("users").doc(id).get()
-          const user = docSnapshotToObject(snapshot)
-          return user
-        },
+    async deleteUser(userId) {
+      const userDoc = doc(Users, userId)
+      const accountsQuery = query(Accounts, where("userId", "==", userId))
+      const sessionsQuery = query(Sessions, where("userId", "==", userId))
 
-        async getUserByEmail(email) {
-          if (!email) return null
+      await runTransaction(db, async (transaction) => {
+        transaction.delete(userDoc)
+        const accounts = await getDocs(accountsQuery)
+        accounts.forEach((account) => transaction.delete(account.ref))
 
-          const snapshot = await client
-            .collection("users")
-            .where("email", "==", email)
-            .limit(1)
-            .get()
+        const sessions = await getDocs(sessionsQuery)
+        sessions.forEach((session) => transaction.delete(session.ref))
+      })
+    },
 
-          const user = querySnapshotToObject(snapshot)
-          return user
-        },
+    async linkAccount(account) {
+      const { id } = await addDoc(Accounts, account)
+      return { ...account, id }
+    },
 
-        async getUserByProviderAccountId(providerId, providerAccountId) {
-          const accountSnapshot = await client
-            .collection("accounts")
-            .where("providerId", "==", providerId)
-            .where("providerAccountId", "==", providerAccountId)
-            .limit(1)
-            .get()
+    async unlinkAccount({ provider, providerAccountId }) {
+      const accountQuery = query(
+        Accounts,
+        where("provider", "==", provider),
+        where("providerAccountId", "==", providerAccountId),
+        limit(1)
+      )
+      const accounts = await getDocs(accountQuery)
+      if (accounts.empty) return
+      await deleteDoc(accounts.docs[0].ref)
+    },
 
-          if (accountSnapshot.empty) return null
+    async createSession(session) {
+      const { id } = await addDoc(Sessions, session)
+      return { ...session, id }
+    },
 
-          const userId = accountSnapshot.docs[0].data().userId
+    async getSessionAndUser(sessionToken) {
+      const sessionQuery = query(
+        Sessions,
+        where("sessionToken", "==", sessionToken),
+        limit(1)
+      )
+      const sessionDocs = await getDocs(sessionQuery)
+      if (sessionDocs.empty) return null
+      const session = Sessions.converter!.fromFirestore(sessionDocs.docs[0])
+      if (!session) return null
 
-          const userSnapshot = await client
-            .collection("users")
-            .doc(userId)
-            .get()
+      const userDoc = await getDoc(doc(Users, session.userId))
+      if (!userDoc.exists()) return null
+      const user = Users.converter!.fromFirestore(userDoc)!
+      return { session, user }
+    },
 
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-          return { ...userSnapshot.data(), id: userSnapshot.id } as any
-        },
+    async updateSession(partialSession) {
+      const sessionQuery = query(
+        Sessions,
+        where("sessionToken", "==", partialSession.sessionToken),
+        limit(1)
+      )
+      const sessionDocs = await getDocs(sessionQuery)
+      if (sessionDocs.empty) return null
+      await updateDoc(sessionDocs.docs[0].ref, partialSession)
+    },
 
-        async updateUser(user) {
-          await client
-            .collection("users")
-            .doc(user.id)
-            .update(stripUndefined(user))
+    async deleteSession(sessionToken) {
+      const sessionQuery = query(
+        Sessions,
+        where("sessionToken", "==", sessionToken),
+        limit(1)
+      )
+      const sessionDocs = await getDocs(sessionQuery)
+      if (sessionDocs.empty) return
+      await deleteDoc(sessionDocs.docs[0].ref)
+    },
 
-          return user
-        },
+    async createVerificationToken(verificationToken) {
+      await addDoc(VerificationTokens, verificationToken)
+      return verificationToken
+    },
 
-        async deleteUser(userId) {
-          await client.collection("users").doc(userId).delete()
-        },
+    async useVerificationToken({ identifier, token }) {
+      const verificationTokensQuery = query(
+        VerificationTokens,
+        where("identifier", "==", identifier),
+        where("token", "==", token),
+        limit(1)
+      )
+      const verificationTokenDocs = await getDocs(verificationTokensQuery)
+      if (verificationTokenDocs.empty) return null
 
-        async linkAccount(
-          userId,
-          providerId,
-          providerType,
-          providerAccountId,
-          refreshToken,
-          accessToken,
-          accessTokenExpires
-        ) {
-          const accountRef = await client.collection("accounts").add(
-            stripUndefined({
-              userId,
-              providerId,
-              providerType,
-              providerAccountId,
-              refreshToken,
-              accessToken,
-              accessTokenExpires,
-            })
-          )
+      await deleteDoc(verificationTokenDocs.docs[0].ref)
 
-          const accountSnapshot = await accountRef.get()
-          const account = docSnapshotToObject(accountSnapshot)
-          return account
-        },
-
-        async unlinkAccount(userId, providerId, providerAccountId) {
-          const snapshot = await client
-            .collection("accounts")
-            .where("userId", "==", userId)
-            .where("providerId", "==", providerId)
-            .where("providerAccountId", "==", providerAccountId)
-            .limit(1)
-            .get()
-
-          const accountId = snapshot.docs[0].id
-
-          await client.collection("accounts").doc(accountId).delete()
-        },
-
-        async createSession(user) {
-          const sessionRef = await client.collection("sessions").add({
-            userId: user.id,
-            expires: new Date(Date.now() + sessionMaxAge),
-            sessionToken: randomBytes(32).toString("hex"),
-            accessToken: randomBytes(32).toString("hex"),
-          })
-          const snapshot = await sessionRef.get()
-          const session = docSnapshotToObject(snapshot)
-          return session
-        },
-
-        async getSession(sessionToken) {
-          const snapshot = await client
-            .collection("sessions")
-            .where("sessionToken", "==", sessionToken)
-            .limit(1)
-            .get()
-
-          const session = querySnapshotToObject<FirebaseSession>(snapshot)
-          if (!session) return null
-
-          // if the session has expired
-          if (session.expires < new Date()) {
-            // delete the session
-            await client.collection("sessions").doc(session.id).delete()
-            return null
-          }
-          // return already existing session
-          return session
-        },
-
-        async updateSession(session, force) {
-          if (
-            !force &&
-            Number(session.expires) - sessionMaxAge + sessionUpdateAge >
-              Date.now()
-          ) {
-            return null
-          }
-
-          // Update the item in the database
-          await client
-            .collection("sessions")
-            .doc(session.id)
-            .update({
-              expires: new Date(Date.now() + sessionMaxAge),
-            })
-
-          return session
-        },
-
-        async deleteSession(sessionToken) {
-          const snapshot = await client
-            .collection("sessions")
-            .where("sessionToken", "==", sessionToken)
-            .limit(1)
-            .get()
-
-          const session = querySnapshotToObject<FirebaseSession>(snapshot)
-          if (!session) return
-
-          await client.collection("sessions").doc(session.id).delete()
-        },
-
-        async createVerificationRequest(identifier, url, token, _, provider) {
-          const verificationRequestRef = await client
-            .collection("verificationRequests")
-            .add({
-              identifier,
-              token: hashToken(token),
-              expires: new Date(Date.now() + provider.maxAge * 1000),
-            })
-
-          // With the verificationCallback on a provider, you can send an email, or queue
-          // an email to be sent, or perform some other action (e.g. send a text message)
-          await provider.sendVerificationRequest({
-            identifier,
-            url,
-            token,
-            baseUrl: appOptions.baseUrl,
-            provider,
-          })
-
-          const snapshot = await verificationRequestRef.get()
-          return docSnapshotToObject<FirebaseVerificationRequest>(snapshot)
-        },
-
-        async getVerificationRequest(identifier, token) {
-          const snapshot = await client
-            .collection("verificationRequests")
-            .where("token", "==", hashToken(token))
-            .where("identifier", "==", identifier)
-            .limit(1)
-            .get()
-
-          const verificationRequest =
-            querySnapshotToObject<FirebaseVerificationRequest>(snapshot)
-          if (!verificationRequest) return null
-
-          if (verificationRequest.expires < new Date()) {
-            // Delete verification entry so it cannot be used again
-            await client
-              .collection("verificationRequests")
-              .doc(verificationRequest.id)
-              .delete()
-            return null
-          }
-          return verificationRequest
-        },
-
-        async deleteVerificationRequest(identifier, token) {
-          const snapshot = await client
-            .collection("verificationRequests")
-            .where("token", "==", hashToken(token))
-            .where("identifier", "==", identifier)
-            .limit(1)
-            .get()
-
-          const verificationRequest =
-            querySnapshotToObject<FirebaseVerificationRequest>(snapshot)
-
-          if (!verificationRequest) return null
-
-          await client
-            .collection("verificationRequests")
-            .doc(verificationRequest.id)
-            .delete()
-        },
-      }
+      const verificationToken = VerificationTokens.converter!.fromFirestore(
+        verificationTokenDocs.docs[0]
+      )
+      // @ts-expect-error
+      delete verificationToken.id
+      return verificationToken
     },
   }
 }
